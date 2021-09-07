@@ -1,0 +1,252 @@
+***************************************************************************
+data_utils.py
+***************************************************************************
+#!/usr/bin/env python
+# -*- coding:utf8 -*-
+
+import cv2
+import numpy as np
+import os
+import pandas as pd #用于读取imu资料
+
+IMU_COLUMN_NAMES = ['lat','lon','alt','roll','pitch','yaw','vn','ve','vf','vl','vu',
+                    'ax','ay','az','af','al','au','wx','wy','wz','wf','wl','wu',
+                    'posacc','velacc','navstat','numsats','posmode','velmode','orimode'
+                    ]#根据kitti数据集中的名称进行定义的，个人理解是对照c里面的宏定义
+
+TRACKING_COLUMN_NAMES=['frame', 'track_id', 'type', 'truncated', 'occluded', 'alpha', 
+                'bbox_left', 'bbox_top','bbox_right', 'bbox_bottom', 'height', 
+                'width', 'length', 'pos_x', 'pos_y', 'pos_z', 'rot_y']#tracking数据单位
+
+
+#读取图片路径函数
+def read_camera(path):
+    return cv2.imread(path)
+
+#读取点云路径函数
+def read_point_cloud(path):
+    return np.fromfile(path,dtype=np.float32).reshape(-1,4)
+
+#读取imu资料
+def read_imu(path):
+    df=pd.read_csv(path,header=None,sep=' ')#读取数据
+    df.columns=IMU_COLUMN_NAMES#给数据赋予单位
+    return df
+
+#读取trackiing资料
+def read_tracking(path):
+    df=pd.read_csv(path,header=None,sep=' ')#读取tracking资料
+    df.columns=TRACKING_COLUMN_NAMES#给资料数据添加单位
+    df.loc[df.type.isin(['Truck','Van','Tram']),'type']='Car'#将这三种车子，统一定义为Car
+    df=df[df.type.isin(['Car','Pedestrian','Cyclist'])]#只是获取数据集中类型为指定的数据，注意car为重定义类型
+    return df#返回读取的资料
+
+
+
+***************************************************************************
+publish_utils.py
+***************************************************************************
+#!/usr/bin/env python
+# -*- coding:utf8 -*-
+
+import rospy
+from std_msgs.msg import Header
+from visualization_msgs.msg import Marker,MarkerArray#Marker绘制相机视野指示线模块,MarkerArray解决Marker带来发布的不同步问题
+from sensor_msgs.msg import Image,PointCloud2,Imu,NavSatFix
+from geometry_msgs.msg import Point#Point来自ros包定义，所以需要定义;若不清楚，则需要到ros官网上面查看具体那个包
+import sensor_msgs.point_cloud2 as pcl2
+from cv_bridge import CvBridge
+import numpy as np
+import tf
+import cv2
+
+FRAME_ID='map'
+DETECTION_COLOR_DICT = {'Car':(255,255,0),'Pedestrian':(0,226,255),'Cyclist':(141,40,255)}#颜色字典
+
+#发布图片函数
+def publish_camera(cam_pub,bridge,image,boxes,types):#增加参数boxes、types
+    #绘制框框到图片中
+    for typ,box in zip(types,boxes):#给对应类型每个box绘制对应颜色图线
+        top_left=int(box[0]),int(box[1])#box的左上角点，像素为整数，所以需要转换int类型
+        bottom_right=int(box[2]),int(box[3])#box的右下角点
+        #绘制框框，依次指定图片、左上角点、右下角点、根据类型不同给的颜色（bgr）、线粗细
+        cv2.rectangle(image,top_left,bottom_right,DETECTION_COLOR_DICT[typ],2)
+    cam_pub.publish(bridge.cv2_to_imgmsg(image,"bgr8"))
+
+#发布点云函数
+def publish_point_cloud(pcl_pub,point_clond):
+    header=Header()
+    header.stamp=rospy.Time.now()
+    header.frame_id=FRAME_ID
+    pcl_pub.publish(pcl2.create_cloud_xyz32(header,point_clond[:,:3]))
+
+#发布相机视野以及车子模型marker函数
+def publish_ego_car(ego_car_pub):
+#publish left and right 45 degree FOV lines and ego car model mesh
+    
+    marker_array=MarkerArray()#解决marker发布不同步问题
+
+    marker=Marker()
+    marker.header.frame_id=FRAME_ID
+    marker.header.stamp=rospy.Time.now()
+
+    marker.id=0#每个marker只能有一个id，有重复的id，只会显示一个
+    marker.action=Marker.ADD#表示添加marker
+    marker.lifetime=rospy.Duration()#lifetime表示marker在画面中显示的时长;Duration()函数，不给任何参数时，表示一直存在
+    marker.type=Marker.LINE_STRIP#所发布marker的类型
+
+    #设定指示线颜色
+    marker.color.r=0.0
+    marker.color.g=1.0
+    marker.color.b=0.0
+    marker.color.a=1.0#透明度，1表示完全不透明
+    marker.scale.x=0.2#大小，这里表示线的粗细
+
+    #根据激光点云的坐标系来定义2号相机的视野范围
+    marker.points=[]
+    marker.points.append(Point(10,-10,0))#Point,属于ros的资料包里面的定义，所以需要导入
+    marker.points.append(Point(0,0,0))
+    marker.points.append(Point(10,10,0))
+
+    marker_array.markers.append(marker)#将指示线marker放到MarkerArray中
+
+    #发布车子外形函数
+    mesh_marker=Marker()
+    mesh_marker.header.frame_id=FRAME_ID
+    mesh_marker.header.stamp=rospy.Time.now()
+
+    mesh_marker.id=-1#id只能设置整数，不能设置带有小数的
+    mesh_marker.lifetime=rospy.Duration()
+    mesh_marker.type=Marker.MESH_RESOURCE#这里的MESH_RESOURCE表示导入的是3d模型
+    mesh_marker.mesh_resource="package://kitti_tutorial/Audi R8/Models/Audi R8.dae"#下载的dae模型存在问题，只是显示部分
+
+    #设定模型位置
+    mesh_marker.pose.position.x=0.0
+    mesh_marker.pose.position.y=0.0
+    mesh_marker.pose.position.z=-1.73#这里负数，是因为以激光雷达坐标系而定义的，1.73是根据官方发布的位置定义所取的
+
+    #设计车子模型的旋转量
+    q=tf.transformations.quaternion_from_euler(0,0,np.pi/2)#(np.pi/2,0,np.pi)这里根据下载的车子模型进行调整
+    mesh_marker.pose.orientation.x=q[0]
+    mesh_marker.pose.orientation.y=q[1]
+    mesh_marker.pose.orientation.z=q[2]
+    mesh_marker.pose.orientation.w=q[3]
+
+    #设置车子模型的颜色
+    mesh_marker.color.r=1.0
+    mesh_marker.color.g=1.0
+    mesh_marker.color.b=1.0
+    mesh_marker.color.a=1.0
+
+    #设置车子模型的大小
+    mesh_marker.scale.x=0.6
+    mesh_marker.scale.y=0.6
+    mesh_marker.scale.z=0.6
+
+    marker_array.markers.append(mesh_marker)#将车子marker放到MarkerArray中
+
+    ego_car_pub.publish(marker_array)
+
+#发布imu资料函数
+def publish_imu(imu_pub,imu_data):
+    imu=Imu()#ros,imu 进行google可以查看文档说明
+    imu.header.frame_id=FRAME_ID
+    imu.header.stamp=rospy.Time.now()
+
+    #旋转角度、加速度，角速度
+    q=tf.transformations.quaternion_from_euler(float(imu_data.roll),float(imu_data.pitch),float(imu_data.yaw))#(np.pi/2,0,np.pi)这里根据下载的车子模型进行调整
+    imu.orientation.x=q[0]#以下四个表示旋转角，将读取的数据转为四元数表示
+    imu.orientation.y=q[1]
+    imu.orientation.z=q[2]
+    imu.orientation.w=q[3]
+    imu.linear_acceleration.x=imu_data.af#根据雷达坐标系，确定x方向线性加速度
+    imu.linear_acceleration.y=imu_data.al#根据雷达坐标系，确定y方向线性加速度
+    imu.linear_acceleration.z=imu_data.au#根据雷达坐标系，确定z方向线性加速度
+    imu.angular_velocity.x=imu_data.wf#这三个表示不同方向的角速度
+    imu.angular_velocity.y=imu_data.wl
+    imu.angular_velocity.z=imu_data.wu
+
+    imu_pub.publish(imu)
+
+#发布gps资料函数
+def publish_gps(gps_pub,imu_data):
+    gps=NavSatFix()#ros里面对于gps资料识别包
+    gps.header.frame_id=FRAME_ID
+    gps.header.stamp=rospy.Time.now()
+
+    gps.latitude=imu_data.lat#纬度
+    gps.longitude=imu_data.lon#经度
+    gps.altitude=imu_data.alt#海拔
+
+    gps_pub.publish(gps)
+
+
+***************************************************************************
+p11_kitti.py
+***************************************************************************
+#!/usr/bin/env python
+# -*- coding:utf8 -*-
+
+from data_utils import *
+from publish_utils import *
+
+DATA_PATH='/home/ylh/data/kitti/RawData/2011_09_26/2011_09_26_drive_0005_sync'
+
+if __name__=='__main__':
+    frame = 0
+    rospy.init_node('kitti_node',anonymous=True)
+    cam_pub=rospy.Publisher('kitti_cam',Image,queue_size=10)#建立发布图片topic
+    pcl_pub=rospy.Publisher('kitti_point_cloud',PointCloud2,queue_size=10)#建立发布点云topic
+    #ego_pub=rospy.Publisher('kitti_ego_car',Marker,queue_size=10)#建立发布指示线marker的topic
+    ego_pub=rospy.Publisher('kitti_ego_car',MarkerArray,queue_size=10)#MarkerArray方式发布
+    #model_pub=rospy.Publisher('kitti_car_model',Marker,queue_size=10)#建立发布车子模型的marker的topic
+    imu_pub=rospy.Publisher('kitti_imu',Imu,queue_size=10)#建立发布imu资料的topic
+    gps_pub=rospy.Publisher('kitti_gps',NavSatFix,queue_size=10)#建立发布gps资料的topic，NavSatFix,ros里面固定卫星侦测
+
+    bridge=CvBridge()
+
+    rate=rospy.Rate(10)
+
+    #读取tracking资料
+    df_tracking=read_tracking('/home/ylh/data/kitti/training/label_02/0000.txt')
+
+
+    while not rospy.is_shutdown():
+        #将tracking资料的绘制框框所需资料筛选并处理
+        boxes = np.array(df_tracking[df_tracking.frame==frame][['bbox_left','bbox_top','bbox_right','bbox_bottom']])#获取tracking资料第frame帧图片中的box们对应的四边坐标
+        types=np.array(df_tracking[df_tracking.frame==frame]['type'])#读取tracking资料第frame帧图片中的物体种类类型并保存到tpyes数组中
+        #读取图片
+        image=read_camera(os.path.join(DATA_PATH,'image_02/data/%010d.png'%frame))
+        
+        #发布图片
+        #publish_camera(cam_pub,bridge,image)
+        publish_camera(cam_pub,bridge,image,boxes,types)#增加参数boxes,types，为了给图片指定类型绘制框框     
+        
+        #读取点云
+        point_clond=read_point_cloud(os.path.join(DATA_PATH,'velodyne_points/data/%010d.bin'%frame))
+
+        #发布点云
+        publish_point_cloud(pcl_pub,point_clond)
+
+        #发布指示线marker;由于不需要读取资料，所以直接发布即可
+        #当采用markerarray发布方式，则车子和指示线都放在这个topic
+        #进行发布即可。故下面的发布车子模型marker可以删除。这样子，可以解决不同marker发布不同步问题
+        publish_ego_car(ego_pub)
+
+        #发布车子模型marker;由于不需要读取资料，所以直接发布即可
+        #publish_car_model(model_pub)
+
+        #读取imu资料，这里也包含了gps资料了
+        imu_data=read_imu(os.path.join(DATA_PATH,'oxts/data/%010d.txt'%frame))
+
+        #发布imu资料
+        publish_imu(imu_pub,imu_data)
+
+        #发布gps资料
+        publish_gps(gps_pub,imu_data)
+        
+        #发布
+        rospy.loginfo("published")
+        rate.sleep()
+        frame+=1
+        frame%=154
